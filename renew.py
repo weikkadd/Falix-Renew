@@ -1285,14 +1285,31 @@ async def process_server(
         f"{format_seconds(before)}"
     )
 
-    # 未读到 Timer: 页面可能停在异常状态 (CF challenge / 无 Timer / 已过期),
-    # 直接提示, 不要误判为 "Add Time 按钮异常"
+    # 未读到 Timer: 页面可能停在异常状态 (CF challenge / 已过期), 也可能
+    # 服务器当前根本没有活动计时器 (Falix 页面显示 "No active timer was
+    # found for this server.", 此时没有 Add Time 按钮, 也无需续期)
     if before is None:
         state = await classify_page_state(page)
 
+        # 无活动计时器: 不是续期失败, 而是当前根本无需续期.
+        # (Falix 计时器在服务器被游玩/暂停时不存在, 之后会重新出现;
+        #  也可能服务器已停止, 需要到控制面板手动启动.)
+        if state == "OFFLINE_NO_TIMER":
+            log(
+                "ℹ️ 服务器当前没有活动计时器, 无需续期"
+            )
+
+            send_tg(
+                "ℹ️ Falix 服务器无活动计时器\n"
+                f"Server ID: {server_id}\n"
+                "当前没有可续期的 Timer (无需续期).\n"
+                "若你的服务器本应在运行, 请到控制面板手动启动."
+            )
+
+            return True
+
         if state in (
             "CF_CHALLENGE",
-            "OFFLINE_NO_TIMER",
             "EXPIRED",
             "LOADING",
         ):
