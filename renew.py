@@ -355,6 +355,84 @@ async def get_body_text(page):
         return ""
 
 
+async def wait_page_ready(page, timeout=20):
+    """等待 Timer 页面真正就绪, 而不是固定睡 3 秒.
+
+    Falix 页面加载后可能先显示 "Loading timer...",
+    固定等待容易把尚未渲染完的页面误判为 "没有 Add Time".
+    """
+    ready_patterns = [
+        r"\d{1,3}:\d{2}:\d{2}",      # HH:MM:SS
+        r"\d{1,3}:\d{2}",            # MM:SS
+        r"add\s*time",               # 英文按钮
+        r"添加\s*时间",               # 中文按钮
+        r"just a moment",            # CF managed challenge
+        r"performing security",
+        r"server is offline",        # 无 Timer 状态
+        r"no active timer",
+        r"start the server first",
+        r"timer has expired",        # Timer 已过期
+        r"loading timer",
+        r"log in|sign in",           # 登录页
+    ]
+    end = time.time() + timeout
+
+    while time.time() < end:
+        text = (await get_body_text(page)).lower()
+
+        if any(
+            re.search(p, text)
+            for p in ready_patterns
+        ):
+            return True
+
+        await page.wait_for_timeout(
+            1000
+        )
+
+    return False
+
+
+async def classify_page_state(page):
+    """识别 Timer 页面当前处于什么状态, 用于故障自诊断."""
+    text = (await get_body_text(page)).lower()
+
+    def has(*words):
+        return all(w in text for w in words)
+
+    if any(p in text for p in [
+        "just a moment",
+        "performing security verification",
+        "checking your browser",
+        "enable javascript and cookies",
+    ]):
+        return "CF_CHALLENGE"
+
+    if (
+        has("server is offline")
+        or has("no active timer")
+        or has("start the server first")
+    ):
+        return "OFFLINE_NO_TIMER"
+
+    if (
+        has("timer has expired")
+        or has("has been stopped")
+    ):
+        return "EXPIRED"
+
+    if has("loading timer"):
+        return "LOADING"
+
+    if (
+        "add time" in text
+        or "添加时间" in text
+    ):
+        return "HAS_ADD_TIME"
+
+    return "UNKNOWN"
+
+
 async def get_remaining_seconds(page):
     text = await get_body_text(page)
 
@@ -498,9 +576,14 @@ async def detect_captcha(page):
             break
 
     # 4. Selector 检测 (iframe / class)
+    #    注意: CF Turnstile 的 iframe src 经常不带 "turnstile" 关键字
+    #    (新版在 challenges.cloudflare.com / captcha-delivery.com 下),
+    #    必须把常见模式都列上, 否则 challenge 页会被当成正常页漏检
     selectors = [
         'iframe[src*="turnstile"]',
         'iframe[src*="captcha"]',
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="captcha-delivery.com"]',
         '[class*="captcha"]',
         '[id*="captcha"]',
     ]
@@ -862,8 +945,19 @@ async def find_add_time_button(page):
 
     # 支持中英文按钮文本:
     # 英文: "Add Time"  /  中文: "添加时间"
+    # Falix 改版兼容: 按钮可能是 button/a/div/[role=button],
+    # 文本可能带额外内容 (如 "+1 Hour"), 因此加了任意可点击元素匹配
+    # 和 JS 遍历兜底 (兼容 div/span 伪按钮).
+    add_en = re.compile(
+        r"add\s*time",
+        re.I,
+    )
+    add_cn = re.compile(
+        r"添加\s*时间",
+    )
+
     candidates = [
-        # 英文 - role=button name 精确匹配
+        # 1. 英文 - role=button name 精确匹配
         page.get_by_role(
             "button",
             name=re.compile(
@@ -872,7 +966,7 @@ async def find_add_time_button(page):
             ),
         ),
 
-        # 中文 - role=button name 精确匹配
+        # 2. 中文 - role=button name 精确匹配
         page.get_by_role(
             "button",
             name=re.compile(
@@ -880,7 +974,7 @@ async def find_add_time_button(page):
             ),
         ),
 
-        # 英文 - get_by_text 精确匹配
+        # 3. 英文 - get_by_text 精确匹配
         page.get_by_text(
             re.compile(
                 r"^\s*Add\s+Time\s*$",
@@ -888,39 +982,25 @@ async def find_add_time_button(page):
             ),
         ),
 
-        # 中文 - get_by_text 精确匹配
+        # 4. 中文 - get_by_text 精确匹配
         page.get_by_text(
             re.compile(
                 r"^\s*添加\s*时间\s*$",
             ),
         ),
 
-        # 英文 - 任意 button 含 "Add Time"
+        # 5. 英文 - 任意可点击元素 (button/a/input/[role=button]) 含 "Add Time"
         page.locator(
-            "button"
+            'button, a, input[type="button"], input[type="submit"], [role="button"]'
         ).filter(
-            has_text=re.compile(
-                r"Add\s*Time",
-                re.I,
-            )
+            has_text=add_en,
         ),
 
-        # 中文 - 任意 button 含 "添加时间"
+        # 6. 中文 - 任意可点击元素含 "添加时间"
         page.locator(
-            "button"
+            'button, a, input[type="button"], input[type="submit"], [role="button"]'
         ).filter(
-            has_text=re.compile(
-                r"添加\s*时间",
-            )
-        ),
-
-        # 兜底 - 任意元素 (含 button/a/div) 含 "添加时间"
-        page.locator(
-            ":has-text('添加时间')"
-        ).filter(
-            has_text=re.compile(
-                r"添加\s*时间",
-            )
+            has_text=add_cn,
         ),
     ]
 
@@ -936,6 +1016,52 @@ async def find_add_time_button(page):
 
         except Exception:
             continue
+
+    # 7. JS 兜底: 遍历全部元素, 按 "元素自身直接文本" 匹配
+    #    (兼容 div/span 伪按钮), 优先可点击标签, 再取 DOM 最深
+    #     (最接近真实按钮), 打标记后返回
+    try:
+        marked = await page.evaluate("""(() => {
+            const RE = /add\\s*time|添加\\s*时间/i;
+            const clickable = 'button, a, input[type="button"], input[type="submit"], [role="button"], [onclick]';
+            const directText = el => Array.from(el.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent || '')
+                .join('')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const depth = el => {
+                let d = 0, p = el;
+                while (p.parentElement) { d++; p = p.parentElement; }
+                return d;
+            };
+            let best = null, bestScore = -1;
+            for (const el of document.querySelectorAll('body *')) {
+                const dt = directText(el);
+                if (!dt || dt.length > 60 || !RE.test(dt)) continue;
+                if (el.closest('[data-falix-addtime]')) continue;
+                const score = (el.matches(clickable) ? 1000 : 0) + depth(el);
+                if (score > bestScore) { bestScore = score; best = el; }
+            }
+            if (best) { best.setAttribute('data-falix-addtime', '1'); return true; }
+            return false;
+        })()""")
+
+        if marked:
+            loc = page.locator('[data-falix-addtime="1"]')
+
+            count = await loc.count()
+
+            for index in range(count):
+                item = loc.nth(index)
+
+                if await item.is_visible():
+                    return item
+
+    except Exception as e:
+        log(
+            f"⚠️ JS 查找 Add Time 兜底失败: {e}"
+        )
 
     return None
 
@@ -1087,9 +1213,8 @@ async def process_server(
 
         return False
 
-    await page.wait_for_timeout(
-        3000
-    )
+    # 等待 Timer 页面真正渲染完成 (兼容 "Loading timer..." 慢加载)
+    await wait_page_ready(page)
 
     # Login
     if not await check_login(page):
@@ -1160,6 +1285,29 @@ async def process_server(
         f"{format_seconds(before)}"
     )
 
+    # 未读到 Timer: 页面可能停在异常状态 (CF challenge / 无 Timer / 已过期),
+    # 直接提示, 不要误判为 "Add Time 按钮异常"
+    if before is None:
+        state = await classify_page_state(page)
+
+        if state in (
+            "CF_CHALLENGE",
+            "OFFLINE_NO_TIMER",
+            "EXPIRED",
+            "LOADING",
+        ):
+            log(
+                f"⚠️ 未读取到 Timer, 页面状态: {state}"
+            )
+
+            send_tg(
+                "⚠️ Falix Timer 未读取到\n"
+                f"Server ID: {server_id}\n"
+                f"页面状态: {state}"
+            )
+
+            return False
+
     # Timer 足够，不续期
     if before is not None:
         threshold = (
@@ -1186,8 +1334,16 @@ async def process_server(
     )
 
     if button is None:
+        state = await classify_page_state(page)
+
+        snippet = (
+            (await get_body_text(page))
+            .replace("\n", " ")
+        )[:200]
+
         log(
-            "❌ 当前页面没有 Add Time"
+            "❌ 当前页面没有 Add Time "
+            f"(页面状态: {state})"
         )
 
         await save_debug(
@@ -1198,7 +1354,9 @@ async def process_server(
 
         send_tg(
             "❌ Falix Add Time 按钮异常\n"
-            f"Server ID: {server_id}"
+            f"Server ID: {server_id}\n"
+            f"页面状态: {state}\n"
+            f"页面文本: {snippet}"
         )
 
         return False
